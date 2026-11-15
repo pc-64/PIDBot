@@ -3,7 +3,6 @@ import argparse
 import json
 import math
 import random
-import re
 import threading
 import time
 from collections import deque
@@ -15,28 +14,21 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
 # ==============================================================================
-# ГЛОБАЛЬНЫЙ ПОТОКОБЕЗОПАСНЫЙ БУФЕР ДАННЫХ
+# ГЛОБАЛЬНЫЙ ПОТОКОБЕЗОПАСНЫЙ БУФЕР ДАННЫХ И ССЫЛКА НА WORKER
 # ==============================================================================
 MAX_POINTS = 200
 data_lock = threading.Lock()
 telemetry_buffer = deque(maxlen=MAX_POINTS)
-
-# Регулярное выражение для парсинга телеметрии с контроллера BGC 1.3
-TELEMETRY_REGEX = re.compile(
-    r"Угол \(robot_angle\):\s*([+-]?\d+(?:\.\d+)?).*?"
-    r"Акселерометр:\s*([+-]?\d+(?:\.\d+)?).*?"
-    r"Скор\. гиро:\s*([+-]?\d+(?:\.\d+)?).*?"
-    r"PID:\s*([+-]?\d+(?:\.\d+)?)"
-)
+ACTIVE_WORKER = None
 
 # ==============================================================================
-# HTML5 + VANILLA JS ВЕБ-ОСЦИЛЛОГРАФ (БЕЗ ВНЕШНИХ CDN)
+# HTML5 + VANILLA JS ВЕБ-ОСЦИЛЛОГРАФ + ПУЛЬТ УПРАВЛЕНИЯ WASD
 # ==============================================================================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Robotics Telemetry Oscilloscope</title>
+<title>Robotics Telemetry Oscilloscope &amp; Control</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -47,6 +39,7 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-direction: column;
     height: 100vh;
     overflow: hidden;
+    user-select: none;
   }
   header {
     background-color: #252526;
@@ -59,12 +52,49 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 15px;
   }
   .title { font-weight: bold; font-size: 16px; color: #fff; }
-  .legend { display: flex; gap: 20px; font-size: 14px; }
+  .legend { display: flex; gap: 20px; font-size: 14px; flex-wrap: wrap; }
   .legend-item { display: flex; align-items: center; gap: 6px; }
   .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
-  .val { font-weight: bold; min-width: 65px; display: inline-block; text-align: right; }
+  .val { font-weight: bold; min-width: 70px; display: inline-block; text-align: right; }
   #canvas-container { flex: 1; position: relative; width: 100%; height: 100%; }
   canvas { display: block; width: 100%; height: 100%; }
+
+  /* Панель управления движением в правом нижнем углу */
+  #controls-overlay {
+    position: absolute;
+    bottom: 25px;
+    right: 30px;
+    background: rgba(37, 37, 38, 0.88);
+    border: 1px solid #444;
+    border-radius: 10px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    backdrop-filter: blur(4px);
+  }
+  .ctrl-title { font-size: 11px; color: #aaa; margin-bottom: 4px; }
+  .ctrl-row { display: flex; gap: 6px; }
+  .btn {
+    width: 44px;
+    height: 44px;
+    background: #333337;
+    border: 1px solid #555;
+    border-radius: 6px;
+    color: #fff;
+    font-weight: bold;
+    font-size: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s;
+  }
+  .btn:hover { background: #45454a; }
+  .btn.active { background: #2196f3; border-color: #64b5f6; color: #fff; }
+  .btn-stop { width: 144px; height: 32px; font-size: 12px; background: #4a2525; border-color: #7a3b3b; }
+  .btn-stop:hover { background: #633030; }
 </style>
 </head>
 <body>
@@ -88,13 +118,28 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="legend-item">
       <span class="dot" style="background:#ba68c8;"></span>
-      <span>PID:</span>
-      <span id="val-pid" class="val" style="color:#ba68c8;">0.00 В</span>
+      <span>MotorPower:</span>
+      <span id="val-pid" class="val" style="color:#ba68c8;">0.00 %</span>
     </div>
   </div>
 </header>
 <div id="canvas-container">
   <canvas id="scope"></canvas>
+
+  <div id="controls-overlay">
+    <div class="ctrl-title">Движение: WASD / Стрелки</div>
+    <div class="ctrl-row">
+      <button class="btn" id="btn-w" onmousedown="startCmd('w')" onmouseup="stopCmd()" onmouseleave="stopCmd()">W</button>
+    </div>
+    <div class="ctrl-row">
+      <button class="btn" id="btn-a" onmousedown="startCmd('a')" onmouseup="stopCmd()" onmouseleave="stopCmd()">A</button>
+      <button class="btn" id="btn-s" onmousedown="startCmd('s')" onmouseup="stopCmd()" onmouseleave="stopCmd()">S</button>
+      <button class="btn" id="btn-d" onmousedown="startCmd('d')" onmouseup="stopCmd()" onmouseleave="stopCmd()">D</button>
+    </div>
+    <div class="ctrl-row">
+      <button class="btn btn-stop" onclick="sendOnce('x')">STOP (Space)</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -128,7 +173,6 @@ function drawGrid(width, height, padLeft, padRight, padTop, padBottom) {
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
 
-  // Горизонтальные линии сетки с шагом 30° от -90° до +90°
   for (let deg = Y_MIN; deg <= Y_MAX; deg += 30) {
     const y = mapY(deg, height, padTop, padBottom);
     ctx.beginPath();
@@ -145,10 +189,9 @@ function drawGrid(width, height, padLeft, padRight, padTop, padBottom) {
     ctx.stroke();
 
     ctx.fillStyle = deg === 0 ? '#ffffff' : '#9e9e9e';
-    ctx.fillText((deg > 0 ? '+' : '') + deg + '°', padLeft - 10, y);
+    ctx.fillText((deg > 0 ? '+' : '') + deg, padLeft - 10, y);
   }
 
-  // Вертикальные линии сетки
   const usableWidth = width - padLeft - padRight;
   ctx.strokeStyle = '#2d2d30';
   ctx.lineWidth = 1;
@@ -202,7 +245,7 @@ function render() {
     document.getElementById('val-acc').textContent = last.acc.toFixed(2) + '°';
     document.getElementById('val-ang').textContent = last.ang.toFixed(2) + '°';
     document.getElementById('val-gyr').textContent = last.gyr.toFixed(2) + ' °/с';
-    document.getElementById('val-pid').textContent = last.pid.toFixed(2) + ' В';
+    document.getElementById('val-pid').textContent = last.pid.toFixed(2) + ' %';
   }
 }
 
@@ -214,18 +257,90 @@ async function pollData() {
       render();
     }
   } catch (e) {
-    // Игнорируем временные ошибки при перезапуске сервера
+  } finally {
+    setTimeout(pollData, 35);
+  }
+}
+pollData();
+
+// ============================================================================
+// ЛОГИКА УПРАВЛЕНИЯ ДВИЖЕНИЕМ (WASD / СТРЕЛКИ / МЫШЬ)
+// ============================================================================
+let activeMoveCmd = null;
+
+function sendOnce(cmd) {
+  fetch('/cmd', { method: 'POST', body: cmd }).catch(() => {});
+}
+
+function highlightBtn(cmd) {
+  ['w', 'a', 's', 'd'].forEach(k => {
+    const el = document.getElementById('btn-' + k);
+    if (el) el.classList.toggle('active', k === cmd);
+  });
+}
+
+function startCmd(cmd) {
+  if (activeMoveCmd !== cmd) {
+    activeMoveCmd = cmd;
+    highlightBtn(cmd);
+    sendOnce(cmd);
   }
 }
 
-setInterval(pollData, 80);
+function stopCmd() {
+  if (activeMoveCmd !== null) {
+    activeMoveCmd = null;
+    highlightBtn(null);
+    sendOnce('x');
+  }
+}
+
+// Периодическая подпитка активной команды (каждые 90 мс) для защиты от автостопа
+setInterval(() => {
+  if (activeMoveCmd) {
+    sendOnce(activeMoveCmd);
+  }
+}, 90);
+
+const KEY_MAP = {
+  'w': 'w', 'ц': 'w', 'arrowup': 'w',
+  's': 's', 'ы': 's', 'arrowdown': 's',
+  'a': 'a', 'ф': 'a', 'arrowleft': 'a',
+  'd': 'd', 'в': 'd', 'arrowright': 'd'
+};
+
+window.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === ' ') {
+    e.preventDefault();
+    stopCmd();
+    return;
+  }
+  if (KEY_MAP[k]) {
+    e.preventDefault();
+    startCmd(KEY_MAP[k]);
+  }
+});
+
+
+
+window.addEventListener('keyup', (e) => {
+  const k = e.key.toLowerCase();
+  if (KEY_MAP[k] && KEY_MAP[k] === activeMoveCmd) {
+    stopCmd();
+  }
+});
+
+window.addEventListener('blur', stopCmd);
 </script>
 </body>
 </html>
 """
 
+
 # ==============================================================================
-# ВЕБ-СЕРВЕР ТЕЛЕМЕТРИИ
+# ВЕБ-СЕРВЕР ТЕЛЕМЕТРИИ И ПРИЕМА КОМАНД УПРАВЛЕНИЯ
 # ==============================================================================
 class TelemetryHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -248,8 +363,22 @@ class TelemetryHTTPHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_POST(self):
+        if self.path == "/cmd":
+            length = int(self.headers.get("Content-Length", 0))
+            cmd = self.rfile.read(length).decode("utf-8", errors="ignore").strip()
+            if cmd and ACTIVE_WORKER:
+                if hasattr(ACTIVE_WORKER, "send_command"):
+                    ACTIVE_WORKER.send_command(cmd)
+                elif hasattr(ACTIVE_WORKER, "handle_command"):
+                    ACTIVE_WORKER.handle_command(cmd)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_error(404)
+
     def log_message(self, format, *args):
-        # Подавляем стандартный вывод HTTP-запросов, чтобы не засорять терминал
         pass
 
 
@@ -285,19 +414,16 @@ class PendulumSimulator:
         self.lock = threading.Lock()
         self.running = True
 
-        # Параметры ПИД и фильтра (идентичны прошивке BGC 1.3)
         self.Kp = 0.85
         self.Ki = 4.50
         self.Kd = 0.035
         self.Gyro_amount = 0.996
 
-        # Физические константы маятника
-        self.dt = 0.004                 # Шаг симуляции: 0.004 с (250 Гц)
-        self.com_offset = 1.5           # Смещение центра масс (°)
-        self.MAX_VOLTS = 9.6            # Ограничение напряжения моторов (±9.6 В)
+        self.dt = 0.004
+        self.com_offset = 1.5
+        self.MAX_VOLTS = 9.6
         self.INTEGRAL_MAX = 4.0
 
-        # Состояние системы
         self.true_angle = 0.5
         self.angular_vel = 0.0
         self.robot_angle = 0.5
@@ -307,6 +433,7 @@ class PendulumSimulator:
         self.target_voltage = 0.0
         self.vertical = True
         self.external_kick = 0.0
+        self.drive_bias = 0.0
 
     def reset(self):
         with self.lock:
@@ -316,7 +443,8 @@ class PendulumSimulator:
             self.integral_sum = 0.0
             self.target_voltage = 0.0
             self.vertical = False
-        msg = "SIM: Сброс маятника в наклон 15.0° (ожидание прохождения через 0°)"
+            self.drive_bias = 0.0
+        msg = "SIM: Сброс маятника в наклон 15.0°"
         print(msg)
         self.logger.log("SIM", msg)
 
@@ -342,6 +470,16 @@ class PendulumSimulator:
             return
 
         with self.lock:
+            if low == "w":
+                self.drive_bias = 2.0
+                return
+            if low == "s":
+                self.drive_bias = -2.0
+                return
+            if low in ("x", "a", "d"):
+                self.drive_bias = 0.0
+                return
+
             try:
                 if low.startswith("kp"):
                     self.Kp = float(low[2:])
@@ -359,7 +497,7 @@ class PendulumSimulator:
                         self.Gyro_amount = val
                         print(f"SIM: Gyro_amount = {self.Gyro_amount}")
                 else:
-                    print(f"SIM: Неизвестная команда '{cmd}'. Доступны: kp, ki, kd, g, kick, reset")
+                    print(f"SIM: Неизвестная команда '{cmd}'. Доступны: kp, ki, kd, g, kick, reset, w/a/s/d/x")
             except ValueError:
                 print(f"SIM: Ошибка формата числа в команде '{cmd}'")
 
@@ -370,27 +508,24 @@ class PendulumSimulator:
         while self.running:
             next_step_time += self.dt
             with self.lock:
-                # 1. Имитация показаний датчиков с заданным гауссовым шумом
-                self.acc_angle = self.true_angle + random.gauss(0.0, 3.0)
+                self.acc_angle = self.true_angle + random.gauss(0.0, 2.5)
                 self.gyro_y = self.angular_vel + random.gauss(0.0, 0.4)
 
-                # 2. Комплементарный фильтр
                 self.robot_angle = (
                     (self.robot_angle + self.gyro_y * self.dt) * self.Gyro_amount
                     + self.acc_angle * (1.0 - self.Gyro_amount)
                 )
 
-                # 3. Логика активации и защиты от падения
                 abs_ang = abs(self.robot_angle)
                 if not self.vertical and abs_ang < 1.0:
                     self.vertical = True
                 elif self.vertical and abs_ang > 40.0:
                     self.vertical = False
 
-                # 4. Расчет ПИД-регулятора
                 if self.vertical:
-                    p_term = self.Kp * self.robot_angle
-                    self.integral_sum += self.Ki * self.robot_angle * self.dt
+                    err = self.robot_angle - self.drive_bias
+                    p_term = self.Kp * err
+                    self.integral_sum += self.Ki * err * self.dt
                     self.integral_sum = max(-self.INTEGRAL_MAX, min(self.INTEGRAL_MAX, self.integral_sum))
                     d_term = -self.Kd * self.gyro_y
 
@@ -400,7 +535,6 @@ class PendulumSimulator:
                     self.integral_sum = 0.0
                     self.target_voltage = 0.0
 
-                # 5. Физика обратного маятника (уравнение движения с демпфированием и смещением ЦМ)
                 gravity_torque = 38.0 * math.sin(math.radians(self.true_angle + self.com_offset))
                 motor_torque = 11.5 * self.target_voltage
                 damping = 0.35 * self.angular_vel
@@ -411,7 +545,6 @@ class PendulumSimulator:
                 self.angular_vel += angular_acc * self.dt
                 self.true_angle += self.angular_vel * self.dt
 
-                # Ограничение механического упора пола (±85°)
                 if self.true_angle > 85.0:
                     self.true_angle = 85.0
                     self.angular_vel = 0.0
@@ -419,15 +552,15 @@ class PendulumSimulator:
                     self.true_angle = -85.0
                     self.angular_vel = 0.0
 
-                # Публикация точки телеметрии каждые 10 шагов (25 Гц -> 40 мс)
                 step_counter += 1
                 if step_counter >= 10:
                     step_counter = 0
+                    pwr_pct = (abs(self.target_voltage) / self.MAX_VOLTS) * 100.0
                     point = {
                         "ang": round(self.robot_angle, 2),
                         "acc": round(self.acc_angle, 2),
                         "gyr": round(self.gyro_y, 2),
-                        "pid": round(self.target_voltage, 2),
+                        "pid": round(pwr_pct, 2),
                     }
                     with data_lock:
                         telemetry_buffer.append(point)
@@ -440,7 +573,7 @@ class PendulumSimulator:
 
 
 # ==============================================================================
-# МЕНЕДЖЕР COM-ПОРТА С АВТОПЕРЕПОДКЛЮЧЕНИЕМ
+# МЕНЕДЖЕР COM-ПОРТА С АВТОПЕРЕПОДКЛЮЧЕНИЕМ И РАЗБОРОМ STX-ПАКЕТОВ
 # ==============================================================================
 class SerialWorker:
     def __init__(self, port: str, baudrate: int, logger: DebugLogger):
@@ -451,6 +584,7 @@ class SerialWorker:
         self.ser_lock = threading.Lock()
         self.running = True
 
+    
     def send_command(self, cmd: str):
         cmd_clean = cmd.strip()
         if not cmd_clean:
@@ -458,7 +592,11 @@ class SerialWorker:
         with self.ser_lock:
             if self.ser and self.ser.is_open:
                 try:
-                    payload = (cmd_clean + "\n").encode("utf-8")
+                    # Для однобуквенных команд движения (w/a/s/d/x) отправляем без лишнего перевода строки
+                    if len(cmd_clean) == 1 and cmd_clean.lower() in ("w", "a", "s", "d", "x"):
+                        payload = cmd_clean.encode("utf-8")
+                    else:
+                        payload = (cmd_clean + "\n").encode("utf-8")
                     self.ser.write(payload)
                     self.logger.log("TX", cmd_clean)
                 except serial.SerialException as e:
@@ -467,6 +605,10 @@ class SerialWorker:
                 print("[SERIAL] Порт не подключен. Команда не отправлена.")
 
     def _parse_stx_packet(self, payload: bytes):
+        """
+        Разбирает пакет формата:
+        <STX> robot_angle <0x01> Acc_angle <0x04> MotorPower% <0x05> gyro_rate <ETX>
+        """
         try:
             part1, rest = payload.split(b"\x01", 1)
             part2, rest = rest.split(b"\x04", 1)
@@ -475,12 +617,12 @@ class SerialWorker:
             robot_ang = float(part1.decode("ascii").strip())
             acc_ang = float(part2.decode("ascii").strip())
             motor_pwr_pct = float(part3.decode("ascii").strip())
-            loop_ms = float(part4.decode("ascii").strip())
+            gyro_rate = float(part4.decode("ascii").strip())
 
             point = {
                 "ang": round(robot_ang, 4),
                 "acc": round(acc_ang, 4),
-                "gyr": round(loop_ms, 3),
+                "gyr": round(gyro_rate, 2),
                 "pid": round(motor_pwr_pct, 2),
             }
             with data_lock:
@@ -488,7 +630,7 @@ class SerialWorker:
 
             self.logger.log(
                 "RX_PKT",
-                f"ang={robot_ang:.4f}, acc={acc_ang:.4f}, pwr={motor_pwr_pct:.1f}%, loop={loop_ms:.3f}ms",
+                f"ang={robot_ang:.4f}, acc={acc_ang:.4f}, pwr={motor_pwr_pct:.1f}%, gyro={gyro_rate:.2f}°/s",
             )
         except Exception as e:
             err_msg = f"[PKT_ERR] Битый пакет {payload!r}: {e}"
@@ -561,15 +703,19 @@ class SerialWorker:
                 print(f"[SERIAL] Связь потеряна ({e}). Повтор через 1.5 с...")
                 self.logger.log("ERR", f"Serial disconnected: {e}")
                 time.sleep(1.5)
+
+
 # ==============================================================================
 # ТОЧКА ВХОДА И ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ
 # ==============================================================================
 def main():
+    global ACTIVE_WORKER
+
     parser = argparse.ArgumentParser(
-        description="COM-терминал, веб-осциллограф и симулятор обратного маятника"
+        description="COM-терминал, веб-осциллограф и пульт управления роботом"
     )
-    parser.add_argument("-p", "--port", type=str, help="Путь к COM-порту (например, /dev/ttyUSB0 или COM3)")
-    parser.add_argument("-b", "--baud", type=int, default=115200, help="Скорость порта (по умолчанию 115200)")
+    parser.add_argument("-p", "--port", type=str, help="Путь к COM-порту (например, /dev/tty.usbserial-... или COM3)")
+    parser.add_argument("-b", "--baud", type=int, default=230400, help="Скорость порта (по умолчанию 230400)")
     parser.add_argument("-w", "--web-port", type=int, default=8000, help="Порт веб-сервера (по умолчанию 8000)")
     parser.add_argument("--sim", action="store_true", help="Запуск в режиме физической симуляции без платы")
     args = parser.parse_args()
@@ -579,21 +725,23 @@ def main():
 
     logger = DebugLogger("com_debug.log")
     start_web_server(args.web_port)
-    print(f"[WEB] Локальный осциллограф запущен: http://127.0.0.1:{args.web_port}")
+    print(f"[WEB] Осциллограф и пульт WASD запущены: http://127.0.0.1:{args.web_port}")
 
     sim_worker = None
     serial_worker = None
 
     if args.sim:
         sim_worker = PendulumSimulator(logger)
+        ACTIVE_WORKER = sim_worker
         t = threading.Thread(target=sim_worker.run, daemon=True)
         t.start()
-        print("[SIM] Режим симуляции активен. Команды: kp<val>, ki<val>, kd<val>, g<val>, kick, reset, exit")
+        print("[SIM] Режим симуляции активен. Управление: WASD в браузере или команды в консоли.")
     else:
         serial_worker = SerialWorker(args.port, args.baud, logger)
+        ACTIVE_WORKER = serial_worker
         t = threading.Thread(target=serial_worker.run, daemon=True)
         t.start()
-        print("[TERM] Введите команду для отправки на плату (например: p1.2, i4.5, d0.03, g0.996) или 'exit'")
+        print("[TERM] Подключено. Управление: WASD в браузере, либо команды (например: o8.5) в консоли.")
 
     session = PromptSession()
     with patch_stdout():
@@ -614,6 +762,9 @@ def main():
         sim_worker.running = False
     if serial_worker:
         serial_worker.running = False
+        with serial_worker.ser_lock:
+            if serial_worker.ser and serial_worker.ser.is_open:
+                serial_worker.ser.close()
 
 
 if __name__ == "__main__":
