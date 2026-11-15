@@ -466,14 +466,45 @@ class SerialWorker:
             else:
                 print("[SERIAL] Порт не подключен. Команда не отправлена.")
 
+    def _parse_stx_packet(self, payload: bytes):
+        try:
+            part1, rest = payload.split(b"\x01", 1)
+            part2, rest = rest.split(b"\x04", 1)
+            part3, part4 = rest.split(b"\x05", 1)
+
+            robot_ang = float(part1.decode("ascii").strip())
+            acc_ang = float(part2.decode("ascii").strip())
+            motor_pwr_pct = float(part3.decode("ascii").strip())
+            loop_ms = float(part4.decode("ascii").strip())
+
+            point = {
+                "ang": round(robot_ang, 4),
+                "acc": round(acc_ang, 4),
+                "gyr": round(loop_ms, 3),
+                "pid": round(motor_pwr_pct, 2),
+            }
+            with data_lock:
+                telemetry_buffer.append(point)
+
+            self.logger.log(
+                "RX_PKT",
+                f"ang={robot_ang:.4f}, acc={acc_ang:.4f}, pwr={motor_pwr_pct:.1f}%, loop={loop_ms:.3f}ms",
+            )
+        except Exception as e:
+            err_msg = f"[PKT_ERR] Битый пакет {payload!r}: {e}"
+            print(err_msg)
+            self.logger.log("ERR_PKT", err_msg)
+
     def run(self):
+        rx_buf = bytearray()
+
         while self.running:
             try:
                 print(f"[SERIAL] Подключение к {self.port} ({self.baudrate} бод)...")
                 ser_conn = serial.Serial(
                     port=self.port,
                     baudrate=self.baudrate,
-                    timeout=0.2,
+                    timeout=0.05,
                     dsrdtr=False,
                     rtscts=False,
                 )
@@ -483,27 +514,40 @@ class SerialWorker:
                 self.logger.log("SYS", f"Connected to {self.port} at {self.baudrate}")
 
                 while self.running:
-                    raw_line = ser_conn.readline()
-                    if not raw_line:
+                    chunk = ser_conn.read(ser_conn.in_waiting or 1)
+                    if not chunk:
                         continue
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
+                    rx_buf.extend(chunk)
 
-                    self.logger.log("RX", line)
-                    match = TELEMETRY_REGEX.search(line)
-                    if match:
-                        point = {
-                            "ang": float(match.group(1)),
-                            "acc": float(match.group(2)),
-                            "gyr": float(match.group(3)),
-                            "pid": float(match.group(4)),
-                        }
-                        with data_lock:
-                            telemetry_buffer.append(point)
-                    else:
-                        # Выводим нетелеметрийные сообщения платы в терминал
-                        print(f"[MCU] {line}")
+                    while rx_buf:
+                        if rx_buf.startswith(b"\x02"):
+                            etx_idx = rx_buf.find(b"\x03")
+                            if etx_idx == -1:
+                                if len(rx_buf) > 128:
+                                    rx_buf.pop(0)
+                                break
+                            packet_body = bytes(rx_buf[1:etx_idx])
+                            del rx_buf[: etx_idx + 1]
+                            self._parse_stx_packet(packet_body)
+                        else:
+                            nl_idx = rx_buf.find(b"\n")
+                            stx_idx = rx_buf.find(b"\x02")
+
+                            if stx_idx != -1 and (nl_idx == -1 or stx_idx < nl_idx):
+                                text_bytes = bytes(rx_buf[:stx_idx])
+                                del rx_buf[:stx_idx]
+                            elif nl_idx != -1:
+                                text_bytes = bytes(rx_buf[: nl_idx + 1])
+                                del rx_buf[: nl_idx + 1]
+                            else:
+                                if len(rx_buf) > 256:
+                                    rx_buf.clear()
+                                break
+
+                            line = text_bytes.decode("utf-8", errors="replace").strip()
+                            if line:
+                                self.logger.log("RX", line)
+                                print(f"[MCU] {line}")
 
             except (serial.SerialException, OSError) as e:
                 with self.ser_lock:
@@ -513,11 +557,10 @@ class SerialWorker:
                         except Exception:
                             pass
                         self.ser = None
+                rx_buf.clear()
                 print(f"[SERIAL] Связь потеряна ({e}). Повтор через 1.5 с...")
                 self.logger.log("ERR", f"Serial disconnected: {e}")
                 time.sleep(1.5)
-
-
 # ==============================================================================
 # ТОЧКА ВХОДА И ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ
 # ==============================================================================
