@@ -59,6 +59,61 @@ HTML_PAGE = """<!DOCTYPE html>
   #canvas-container { flex: 1; position: relative; width: 100%; height: 100%; }
   canvas { display: block; width: 100%; height: 100%; }
 
+  /* Панель настройки PID в левом нижнем углу */
+  #pid-overlay {
+    position: absolute;
+    bottom: 25px;
+    left: 65px;
+    background: rgba(37, 37, 38, 0.88);
+    border: 1px solid #444;
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    backdrop-filter: blur(4px);
+  }
+  .pid-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .pid-row label {
+    min-width: 68px;
+    color: #ccc;
+    font-weight: bold;
+  }
+  .pid-row input {
+    width: 85px;
+    background: #1e1e1e;
+    border: 1px solid #555;
+    border-radius: 4px;
+    color: #fff;
+    padding: 4px 6px;
+    font-family: monospace;
+    font-size: 13px;
+    text-align: right;
+  }
+  .pid-row input:focus {
+    outline: none;
+    border-color: #2196f3;
+  }
+  .btn-set {
+    background: #2e7d32;
+    border: 1px solid #4caf50;
+    border-radius: 4px;
+    color: #fff;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .btn-set:hover { background: #388e3c; }
+  .btn-set:active { background: #1b5e20; }
+
   /* Панель управления движением в правом нижнем углу */
   #controls-overlay {
     position: absolute;
@@ -113,8 +168,8 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="legend-item">
       <span class="dot" style="background:#4caf50;"></span>
-      <span>gyroY:</span>
-      <span id="val-gyr" class="val" style="color:#4caf50;">0.00 °/с</span>
+      <span>Cycle / Gyro:</span>
+      <span id="val-gyr" class="val" style="color:#4caf50;">0.00</span>
     </div>
     <div class="legend-item">
       <span class="dot" style="background:#ba68c8;"></span>
@@ -126,6 +181,37 @@ HTML_PAGE = """<!DOCTYPE html>
 <div id="canvas-container">
   <canvas id="scope"></canvas>
 
+  <!-- Панель настройки коэффициентов PID -->
+  <div id="pid-overlay">
+    <div class="ctrl-title">Настройка PID (Enter / Set)</div>
+    <div class="pid-row">
+      <label for="inp-kp">Kp:</label>
+      <input type="number" id="inp-kp" step="0.01" value="0.2" onkeydown="handlePidKey(event, 'p', 'inp-kp')">
+      <button class="btn-set" onclick="sendPid('p', 'inp-kp')">Set</button>
+    </div>
+    <div class="pid-row">
+      <label for="inp-ki">Ki (Kc):</label>
+      <input type="number" id="inp-ki" step="0.0001" value="0.0002" onkeydown="handlePidKey(event, 'i', 'inp-ki')">
+      <button class="btn-set" onclick="sendPid('i', 'inp-ki')">Set</button>
+    </div>
+    <div class="pid-row">
+      <label for="inp-kd">Kd:</label>
+      <input type="number" id="inp-kd" step="0.1" value="4.17" onkeydown="handlePidKey(event, 'k', 'inp-kd')">
+      <button class="btn-set" onclick="sendPid('k', 'inp-kd')">Set</button>
+    </div>
+    <div class="pid-row">
+      <label for="inp-kv">Kv:</label>
+      <input type="number" id="inp-kv" step="0.005" value="0.02" onkeydown="handlePidKey(event, 'v', 'inp-kv')">
+      <button class="btn-set" onclick="sendPid('v', 'inp-kv')">Set</button>
+    </div>
+    <div class="pid-row">
+      <label for="inp-off">Offset:</label>
+      <input type="number" id="inp-off" step="0.1" value="-12.0" onkeydown="handlePidKey(event, 'o', 'inp-off')">
+      <button class="btn-set" onclick="sendPid('o', 'inp-off')">Set</button>
+    </div>
+  </div>
+
+  <!-- Панель управления движением -->
   <div id="controls-overlay">
     <div class="ctrl-title">Движение: WASD / Стрелки</div>
     <div class="ctrl-row">
@@ -223,7 +309,6 @@ function drawSeries(key, color, width, height, padLeft, padRight, padTop, padBot
   }
   ctx.stroke();
 }
-
 function render() {
   const rect = canvas.parentElement.getBoundingClientRect();
   const width = rect.width;
@@ -244,7 +329,7 @@ function render() {
     const last = points[points.length - 1];
     document.getElementById('val-acc').textContent = last.acc.toFixed(2) + '°';
     document.getElementById('val-ang').textContent = last.ang.toFixed(2) + '°';
-    document.getElementById('val-gyr').textContent = last.gyr.toFixed(2) + ' °/с';
+    document.getElementById('val-gyr').textContent = last.gyr.toFixed(2);
     document.getElementById('val-pid').textContent = last.pid.toFixed(2) + ' %';
   }
 }
@@ -262,6 +347,26 @@ async function pollData() {
   }
 }
 pollData();
+
+// ============================================================================
+// ОТПРАВКА КОЭФФИЦИЕНТОВ PID
+// ============================================================================
+function sendPid(prefix, inputId) {
+  const inp = document.getElementById(inputId);
+  const val = parseFloat(inp.value);
+  if (!isNaN(val)) {
+    sendOnce(prefix + val);
+    inp.blur();
+  }
+}
+
+function handlePidKey(e, prefix, inputId) {
+  e.stopPropagation(); // Не запускать WASD при вводе цифр
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    sendPid(prefix, inputId);
+  }
+}
 
 // ============================================================================
 // ЛОГИКА УПРАВЛЕНИЯ ДВИЖЕНИЕМ (WASD / СТРЕЛКИ / МЫШЬ)
@@ -295,7 +400,6 @@ function stopCmd() {
   }
 }
 
-// Периодическая подпитка активной команды (каждые 90 мс) для защиты от автостопа
 setInterval(() => {
   if (activeMoveCmd) {
     sendOnce(activeMoveCmd);
@@ -310,6 +414,7 @@ const KEY_MAP = {
 };
 
 window.addEventListener('keydown', (e) => {
+  if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
   if (e.repeat) return;
   const k = e.key.toLowerCase();
   if (k === ' ') {
@@ -323,9 +428,8 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-
-
 window.addEventListener('keyup', (e) => {
+  if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
   const k = e.key.toLowerCase();
   if (KEY_MAP[k] && KEY_MAP[k] === activeMoveCmd) {
     stopCmd();
@@ -337,7 +441,6 @@ window.addEventListener('blur', stopCmd);
 </body>
 </html>
 """
-
 
 # ==============================================================================
 # ВЕБ-СЕРВЕР ТЕЛЕМЕТРИИ И ПРИЕМА КОМАНД УПРАВЛЕНИЯ

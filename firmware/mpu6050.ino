@@ -49,7 +49,10 @@ bool Bat_Discharged = false;      //true when (Bat_Voltage < dischargeVoltage)
 #define MPU6050 0x68              //Device address
 #define ACCEL_CONFIG 0x1C         //Accelerometer configuration address
 #define GYRO_CONFIG 0x1B          //Gyro configuration address
-
+float kc = 0.0002;
+float kv = 0.02;
+float kp = 0.2;
+float kd = 0.025 / (2 * 0.003);
 //Registers: Accelerometer, Temp, Gyroscope
 #define ACCEL_XOUT_H 0x3B
 #define ACCEL_XOUT_L 0x3C
@@ -152,10 +155,10 @@ int32_t robot_position = 0; //offset from corect position
 
 
 //loop tuning values
-#define kc 0.0002          //position feedback gain, (reposition robot after disturbance)0.0002
-#define kv 0.02             //velocity feedback gain 0.02
-#define kp 0.2             //angle gain 0.2
-#define kd 0.025/(2*0.003) //angle velocity gain 0.025
+//#define kc 0.0002          //position feedback gain, (reposition robot after disturbance)0.0002
+//#define kv 0.02             //velocity feedback gain 0.02
+//#define kp 0.2             //angle gain 0.2
+//#define kd 0.025/(2*0.003) //angle velocity gain 0.025
 float angle_offset = -12;
 float drive_cmd = 0.0;
 int16_t turn_cmd = 0;
@@ -242,10 +245,12 @@ void loop()
       else if (c == 'a' || c == 'A') { turn_cmd = -10;    cmd_timeout = 60; }
       else if (c == 'd' || c == 'D') { turn_cmd = 10;     cmd_timeout = 60; }
       else if (c == 'x' || c == 'X') { drive_cmd = 0.0;   turn_cmd = 0;  cmd_timeout = 0; }
-      else if (c == 'o' || c == 'O') {
-        Serial.setTimeout(5);
-        angle_offset = Serial.parseFloat();
-      }
+      else if (c == 'o' || c == 'O') { Serial.setTimeout(5); angle_offset = Serial.parseFloat(); }
+      else if (c == 'p' || c == 'P') { Serial.setTimeout(5); kp = Serial.parseFloat(); }
+      else if (c == 'i' || c == 'I') { Serial.setTimeout(5); kc = Serial.parseFloat(); }
+      else if (c == 'k' || c == 'K') { Serial.setTimeout(5); kd = Serial.parseFloat(); }
+      else if (c == 'v' || c == 'V') { Serial.setTimeout(5); kv = Serial.parseFloat(); }
+
     }
 
     // Автоматическая остановка при отпускании клавиши (через ~240 мс)
