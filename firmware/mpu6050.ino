@@ -42,17 +42,20 @@ bool Bat_Discharged = false;      //true when (Bat_Voltage < dischargeVoltage)
 #define dischargeVoltage  2*3.0*50.76    //number of cells * lipo cell discharged voltage / ((5/1023)*(13.3/3.3))
 #define resetVoltage  2*3.7*50.76        //voltage to reset Bat_Discharged to false
 
-
+#define FREQ_MASK 0x3FF
+char rx_buf[16];
+uint8_t rx_idx = 0;
 //angle calculations from MPU-6050--------------------------------------------------
 #include <Wire.h>
 
-#define MPU6050 0x68              //Device address
-#define ACCEL_CONFIG 0x1C         //Accelerometer configuration address
-#define GYRO_CONFIG 0x1B          //Gyro configuration address
 float kc = 0.0002;
 float kv = 0.02;
 float kp = 0.2;
 float kd = 0.025 / (2 * 0.003);
+#define MPU6050 0x68              //Device address
+#define ACCEL_CONFIG 0x1C         //Accelerometer configuration address
+#define GYRO_CONFIG 0x1B          //Gyro configuration address
+
 //Registers: Accelerometer, Temp, Gyroscope
 #define ACCEL_XOUT_H 0x3B
 #define ACCEL_XOUT_L 0x3C
@@ -158,8 +161,8 @@ int32_t robot_position = 0; //offset from corect position
 //#define kc 0.0002          //position feedback gain, (reposition robot after disturbance)0.0002
 //#define kv 0.02             //velocity feedback gain 0.02
 //#define kp 0.2             //angle gain 0.2
-//#define kd 0.025/(2*0.003) //angle velocity gain 0.025
-float angle_offset = -12;
+//#define kd 0.020/(2*0.003) //angle velocity gain 0.025
+float angle_offset = 0;
 float drive_cmd = 0.0;
 int16_t turn_cmd = 0;
 uint8_t cmd_timeout = 0;
@@ -167,8 +170,8 @@ uint8_t cmd_timeout = 0;
 #define _PWM_FREQUENCY_MAX 32000
 #define _PWM_FREQUENCY_MIN 4000
 //Assign Pins for Motor Control
-#define PID_out_max 5
-#define PID_out_min -5
+#define PID_out_max 20
+#define PID_out_min -25
 
 float PID_in, last_PID_in, Last_last_PID_in, PID_out;
 
@@ -204,88 +207,108 @@ void setup()
 
 
   //Setup brushless motor Controller
-  Bl_Setup();
+   Bl_Setup();
   Serial.println("place robot vertical to run");
 
   while (Serial.available())  Serial.read();        // empty RX buffer
 }
 
-
 void loop()
 {
-  //run main loop every ~4ms
-  if ((freqCounter & 0x04f) == 0)
+  // Безопасное чтение младшего байта (атомарно на 8-бит AVR для масок до 0xFF)
+  if ((freqCounter & 0x07f) == 0)
   {
-
-    // record when loop starts
     oldfreqCounter = freqCounter;
 
-    //test battery voltage every ~1s
-    if ((freqCounter & 0x7FFF) == 0)
+    // Отправка телеметрии (для 115200 бод: 0x3FF -> ~30.6 Гц)
+    if ((freqCounter & FREQ_MASK) == 0)
     {
-     // battery_test();
+      sendBlueToothData();
     }
 
-    //send bluetooth output to smartphone every ~0.13s
-    if ((freqCounter & 0xFFF) == 0)
-    {
-   sendBlueToothData();
-    }
-
-    //receive bluetooth input from smartphone
-   //bluetooth();
-
-    //calculate angle of robot
+    // Расчёт угла наклона
     angle_calc();
-      if (Serial.available() > 0)
+
+    // Неблокирующий приём команд движения и PID
+      while (Serial.available() > 0)
     {
       char c = Serial.read();
-      if (c == 'w' || c == 'W') { drive_cmd = 35.0;  turn_cmd = 0;  cmd_timeout = 60; }
-      else if (c == 's' || c == 'S') { drive_cmd = -35.0; turn_cmd = 0;  cmd_timeout = 60; }
-      else if (c == 'a' || c == 'A') { turn_cmd = -10;    cmd_timeout = 60; }
-      else if (c == 'd' || c == 'D') { turn_cmd = 10;     cmd_timeout = 60; }
-      else if (c == 'x' || c == 'X') { drive_cmd = 0.0;   turn_cmd = 0;  cmd_timeout = 0; }
-      else if (c == 'o' || c == 'O') { Serial.setTimeout(5); angle_offset = Serial.parseFloat(); }
-      else if (c == 'p' || c == 'P') { Serial.setTimeout(5); kp = Serial.parseFloat(); }
-      else if (c == 'i' || c == 'I') { Serial.setTimeout(5); kc = Serial.parseFloat(); }
-      else if (c == 'k' || c == 'K') { Serial.setTimeout(5); kd = Serial.parseFloat(); }
-      else if (c == 'v' || c == 'V') { Serial.setTimeout(5); kv = Serial.parseFloat(); }
 
+      // 1. Мгновенные однобуквенные команды срабатывают ВСЕГДА (сбрасывая rx_idx)
+      if (c == 'w' || c == 'W')      { rx_idx = 0; drive_cmd = 55.0;  cmd_timeout = 60; continue; }
+      else if (c == 's' || c == 'S') { rx_idx = 0; drive_cmd = -55.0; cmd_timeout = 60; continue; }
+      else if (c == 'a' || c == 'A') { rx_idx = 0; turn_cmd = -10;    cmd_timeout = 60; continue; }
+      else if (c == 'd' || c == 'D') { rx_idx = 0; turn_cmd = 10;     cmd_timeout = 60; continue; }
+      else if (c == 'x' || c == 'X') { rx_idx = 0; drive_cmd = 0.0;   turn_cmd = 0; cmd_timeout = 0; continue; }
+      else if (c == '0' && rx_idx == 0)
+      {
+        // '0' (когда это не часть числа вроде p0.2): полная остановка и калибровка гироскопа
+        motorPowerOff();
+        vertical = false;
+        Last_last_PID_in = 0;
+        last_PID_in = 0;
+        MotorPower = 0;
+        robot_speed = 0;
+        robot_position = 0;
+        drive_cmd = 0.0;
+        turn_cmd = 0;
+
+        Serial.println("STOP (0) -> Re-initializing gyro...");
+        angle_setup();
+        Serial.println("Gyro ready. Place vertical.");
+        while (Serial.available()) Serial.read();
+        continue;
+      }
+
+      // 2. Конец строки: разбор PID-коэффициента (например, p0.25\n)
+      if (c == '\n' || c == '\r')
+      {
+        rx_buf[rx_idx] = '\0';
+        if (rx_idx > 1)
+        {
+          char key = *rx_buf;
+          float val = atof(rx_buf + 1);
+          if (key == 'o' || key == 'O')      angle_offset = val;
+          else if (key == 'p' || key == 'P') kp = val;
+          else if (key == 'i' || key == 'I') kc = val;
+          else if (key == 'k' || key == 'K') kd = val;
+          else if (key == 'v' || key == 'V') kv = val;
+        }
+        rx_idx = 0;
+      }
+      // 3. Накопление символов числа (включая '0' внутри числа p0.25)
+      else if (c != ' ')
+      {
+        if (rx_idx < sizeof(rx_buf) - 1) rx_buf[rx_idx++] = c;
+        else rx_idx = 0;
+      }
     }
 
-    // Автоматическая остановка при отпускании клавиши (через ~240 мс)
+    // Автоматическая остановка при отпускании клавиши (~245 мс)
     if (cmd_timeout > 0) {
       cmd_timeout--;
     } else {
       drive_cmd = 0.0;
       turn_cmd = 0;
     }
- // Serial.println(robot_angle);
-    //run if on sent from smartphone and battery is charged
-    if (power == true ) PID_and_motor_comd();
+
+    if (power == true) PID_and_motor_comd();
     else
     {
-      motorPowerOff();               //turn motors off if battery is discharged / powered off
+      motorPowerOff();
       Last_last_PID_in = 0;
       last_PID_in = 0;
       MotorPower = 0;
       robot_speed = 0;
       robot_position = 0;
-      // Serial.println("stop");
     }
 
-
-    //calculate loop time
     if (freqCounter > oldfreqCounter)
     {
       if (loop_time < (freqCounter - oldfreqCounter)) loop_time = freqCounter - oldfreqCounter;
     }
-
   }
 }
-
-
-
 
 //AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 //------------------------------------------------------------------------------------
@@ -343,7 +366,7 @@ void sendBlueToothData()
   Serial.print(robot_angle, 4);    Serial.print((char)0x1);   // buttons status feedback
    Serial.print(Acc_angle, 4);     Serial.print((char)0x4);   // datafield #1
   Serial.print(MotorPower * 0.3921);        Serial.print((char)0x5);   // datafield #2
-  Serial.print(loop_time * 0.0318);                                    // datafield #3
+  Serial.print(GyZ / 65.536, 2);                                    // datafield #3
   Serial.print((char)ETX);                                             // End of Transmission
 
 
@@ -503,7 +526,7 @@ void PID_and_motor_comd()
     if (PID_out >= 0 ) MotorPower = (idl_motor_power + PID_out * 100) * (0.000035 * robot_speed * robot_speed + 1);
     if (PID_out < 0 ) MotorPower = (idl_motor_power - PID_out * 100) * (0.000035 * robot_speed * robot_speed + 1);
 
-    if (MotorPower > 255) MotorPower = 205;
+    if (MotorPower > 235) MotorPower = 235;
 
     //run motors
     MoveMotors(R_Motor, (uint8_t)(R_MotorStep >> 8), MotorPower);
@@ -682,6 +705,10 @@ void angle_setup()
   writeTo(MPU6050, GYRO_CONFIG, gyroSens << 3); // Specifying output scaling of gyroscope
   delay (100);
 
+ // ОБЯЗАТЕЛЬНО сбрасываем старые значения перед повторной калибровкой!
+  GyZ_offset = 0;
+  GyZ_offset_sum = 0;
+  robot_angle = 0;
   // calc Z gyro offset by averaging 1024 values
   if (GyZ_filter_on == true)
   {
@@ -754,7 +781,11 @@ void angle_calc()
   GyZ += GyZ_offset;
 
   //use complementary filter to calculate robot angle
-  robot_angle += GyZ * 6.07968E-5;                      //integrate gyroscope to get angle       * 0.003984 (sec) / 65.536 (bits / (deg/sec))
+// Для цикла 4 мс (маска 0x7F):
+robot_angle += GyZ * 6.07968E-5;
+
+// Для цикла 1 мс (маска 0x1F):
+  // robot_angle += GyZ *2 * 1.52E-5; // то же самое, что GyZ * 0.0000152
   Acc_angle =  atan2(AcY, -AcX) * 57.2958;              //angle from acc. values       * 57.2958 (deg/rad)
   robot_angle = robot_angle * Gyro_amount + Acc_angle * (1.0 - Gyro_amount);
 

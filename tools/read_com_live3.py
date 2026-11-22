@@ -1,4 +1,63 @@
-#!/usr/bin/env python3
+import contextlib as _pidbot_ctx
+import sys as _pidbot_sys
+import time as _pidbot_time
+import types as _pidbot_types
+
+if "prompt_toolkit" not in _pidbot_sys.modules:
+    try:
+        import prompt_toolkit  # noqa: F401
+    except ImportError:
+        _pt = _pidbot_types.ModuleType("prompt_toolkit")
+        _pt_patch = _pidbot_types.ModuleType("prompt_toolkit.patch_stdout")
+
+
+        class _StubPromptSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def prompt(self, *args, **kwargs):
+                while True:
+                    _pidbot_time.sleep(3600)
+
+
+        @_pidbot_ctx.contextmanager
+        def _stub_patch_stdout(*args, **kwargs):
+            yield
+
+
+        _pt.PromptSession = _StubPromptSession
+        _pt_patch.patch_stdout = _stub_patch_stdout
+        _pidbot_sys.modules["prompt_toolkit"] = _pt
+        _pidbot_sys.modules["prompt_toolkit.patch_stdout"] = _pt_patch
+
+if "serial" not in _pidbot_sys.modules:
+    try:
+        import serial  # noqa: F401
+    except ImportError:
+        _ser = _pidbot_types.ModuleType("serial")
+        _ser_tools = _pidbot_types.ModuleType("serial.tools")
+        _ser_list = _pidbot_types.ModuleType("serial.tools.list_ports")
+
+
+        class _SerialException(Exception):
+            pass
+
+
+        class _StubSerial:
+            def __init__(self, *args, **kwargs):
+                raise _SerialException("pyserial not installed; use --sim or install pyserial")
+
+
+        _ser.Serial = _StubSerial
+        _ser.SerialException = _SerialException
+        _ser_list.comports = lambda *a, **kw: []
+        _ser.tools = _ser_tools
+        _ser_tools.list_ports = _ser_list
+        _pidbot_sys.modules["serial"] = _ser
+        _pidbot_sys.modules["serial.tools"] = _ser_tools
+        _pidbot_sys.modules["serial.tools.list_ports"] = _ser_list
+
+# !/usr/bin/env python3
 import argparse
 import json
 import math
@@ -13,10 +72,45 @@ import serial
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
+# PIDBOT_HEADLESS_SHIM_APPLIED
+import contextlib as _pidbot_ctx2
+import sys as _pidbot_sys2
+import time as _pidbot_time2
+
+if not _pidbot_sys2.stdin.isatty():
+    class _HeadlessPromptSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prompt(self, *args, **kwargs):
+            while True:
+                _pidbot_time2.sleep(3600)
+
+
+    @_pidbot_ctx2.contextmanager
+    def _headless_patch_stdout(*args, **kwargs):
+        yield
+
+
+    PromptSession = _HeadlessPromptSession
+    patch_stdout = _headless_patch_stdout
+
 # ==============================================================================
 # ГЛОБАЛЬНЫЙ ПОТОКОБЕЗОПАСНЫЙ БУФЕР ДАННЫХ И ССЫЛКА НА WORKER
 # ==============================================================================
-MAX_POINTS = 200
+# Расчёт количества точек по времени окна:
+# F_CPU (16 MHz) / (510 тактов Phase Correct PWM * 256 тиков маски 0xFF) ≈ 122.55 Гц
+# F_CPU = 16 MHz, период Phase Correct PWM = 510 тактов (0xFF * 2),
+# делитель по маске (freqCounter & 0xFF) == 0 -> срабатывает каждые (0xFF + 1) тиков
+
+F_CPU = 16_000_000  # Частота кварца ATmega328P (16 МГц)
+PWM_PERIOD_TICKS = 0xFF * 2  # 510 тактов (Phase Correct PWM, 8-bit)
+FREQ_MASK = 0x3FF  # Маска из прошивки: if ((freqCounter & 0xFF) == 0)
+
+SAMPLE_RATE_HZ = F_CPU / (PWM_PERIOD_TICKS * (FREQ_MASK + 1))
+WINDOW_SECONDS = 10.0
+MAX_POINTS = int(round(SAMPLE_RATE_HZ * WINDOW_SECONDS))
+
 data_lock = threading.Lock()
 telemetry_buffer = deque(maxlen=MAX_POINTS)
 ACTIVE_WORKER = None
@@ -56,8 +150,18 @@ HTML_PAGE = """<!DOCTYPE html>
   .legend-item { display: flex; align-items: center; gap: 6px; }
   .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
   .val { font-weight: bold; min-width: 70px; display: inline-block; text-align: right; }
-  #canvas-container { flex: 1; position: relative; width: 100%; height: 100%; }
-  canvas { display: block; width: 100%; height: 100%; }
+  #canvas-container {
+    flex: 1;
+    min-height: 0; /* Важно для flexbox, чтобы график не выдавливался за экран */
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
 
   /* Панель настройки PID в левом нижнем углу */
   #pid-overlay {
@@ -206,7 +310,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="pid-row">
       <label for="inp-off">Offset:</label>
-      <input type="number" id="inp-off" step="0.1" value="-12.0" onkeydown="handlePidKey(event, 'o', 'inp-off')">
+      <input type="number" id="inp-off" step="0.1" value="-1.0" onkeydown="handlePidKey(event, 'o', 'inp-off')">
       <button class="btn-set" onclick="sendPid('o', 'inp-off')">Set</button>
     </div>
   </div>
@@ -223,7 +327,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <button class="btn" id="btn-d" onmousedown="startCmd('d')" onmouseup="stopCmd()" onmouseleave="stopCmd()">D</button>
     </div>
     <div class="ctrl-row">
-      <button class="btn btn-stop" onclick="sendOnce('x')">STOP (Space)</button>
+      <button class="btn btn-stop" onclick="sendOnce('0')">STOP (0 / Space)</button>
     </div>
   </div>
 </div>
@@ -231,9 +335,10 @@ HTML_PAGE = """<!DOCTYPE html>
 <script>
 const canvas = document.getElementById('scope');
 const ctx = canvas.getContext('2d');
-const MAX_POINTS = 200;
-const Y_MIN = -90;
-const Y_MAX = 90;
+const MAX_POINTS = __MAX_POINTS__;
+const WINDOW_SEC = __WINDOW_SEC__;
+const Y_MIN = -120;
+const Y_MAX = 120;
 
 let points = [];
 
@@ -281,14 +386,23 @@ function drawGrid(width, height, padLeft, padRight, padTop, padBottom) {
   const usableWidth = width - padLeft - padRight;
   ctx.strokeStyle = '#2d2d30';
   ctx.lineWidth = 1;
-  for (let i = 0; i <= 10; i++) {
-    const x = padLeft + (usableWidth / 10) * i;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const gridCols = 10; // деления каждые 10 секунд для окна 60с
+  for (let i = 0; i <= gridCols; i++) {
+    const x = padLeft + (usableWidth / gridCols) * i;
     ctx.beginPath();
     ctx.moveTo(x, padTop);
     ctx.lineTo(x, height - padBottom);
     ctx.stroke();
+
+    ctx.fillStyle = '#9e9e9e';
+    const secAgo = ((10 - i) * (WINDOW_SEC / 10)).toFixed(1).replace(/\.0$/, '');
+    ctx.fillText(i === 10 ? '0s' : `-${secAgo}s`, x, height - padBottom + 4);
   }
+
 }
+
 
 function drawSeries(key, color, width, height, padLeft, padRight, padTop, padBottom) {
   if (points.length < 2) return;
@@ -314,9 +428,9 @@ function render() {
   const width = rect.width;
   const height = rect.height;
   const padLeft = 55;
-  const padRight = 20;
+  const padRight = 28;
   const padTop = 20;
-  const padBottom = 20;
+  const padBottom = 28;
 
   drawGrid(width, height, padLeft, padRight, padTop, padBottom);
 
@@ -343,7 +457,7 @@ async function pollData() {
     }
   } catch (e) {
   } finally {
-    setTimeout(pollData, 35);
+    setTimeout(pollData, 100);
   }
 }
 pollData();
@@ -417,9 +531,18 @@ window.addEventListener('keydown', (e) => {
   if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
   if (e.repeat) return;
   const k = e.key.toLowerCase();
-  if (k === ' ') {
+// В обработчике клавиши пробел (window.addEventListener('keydown', ...)):
+  if (k === ' ' || k === '0') {
     e.preventDefault();
-    stopCmd();
+    activeMoveCmd = null;
+    highlightBtn(null);
+    sendOnce('0');
+    return;
+  }
+
+  if (k === 'x' || k === 'ч') {
+    e.preventDefault();
+    stopCmd(); // Сбрасывает activeMoveCmd, гасит подсветку и отправляет 'x'
     return;
   }
   if (KEY_MAP[k]) {
@@ -442,13 +565,19 @@ window.addEventListener('blur', stopCmd);
 </html>
 """
 
+
 # ==============================================================================
 # ВЕБ-СЕРВЕР ТЕЛЕМЕТРИИ И ПРИЕМА КОМАНД УПРАВЛЕНИЯ
 # ==============================================================================
 class TelemetryHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
-            content = HTML_PAGE.encode("utf-8")
+            html = (
+                HTML_PAGE
+                .replace("__MAX_POINTS__", str(MAX_POINTS))
+                .replace("__WINDOW_SEC__", str(WINDOW_SECONDS))
+            )
+            content = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
@@ -486,7 +615,7 @@ class TelemetryHTTPHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server(port: int):
-    server = ThreadingHTTPServer(("127.0.0.1", port), TelemetryHTTPHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), TelemetryHTTPHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -565,7 +694,7 @@ class PendulumSimulator:
         self.logger.log("TX_SIM", cmd)
 
         low = cmd.lower()
-        if low == "reset":
+        if low in ("reset", "0"):
             self.reset()
             return
         if low == "kick":
@@ -615,8 +744,8 @@ class PendulumSimulator:
                 self.gyro_y = self.angular_vel + random.gauss(0.0, 0.4)
 
                 self.robot_angle = (
-                    (self.robot_angle + self.gyro_y * self.dt) * self.Gyro_amount
-                    + self.acc_angle * (1.0 - self.Gyro_amount)
+                        (self.robot_angle + self.gyro_y * self.dt) * self.Gyro_amount
+                        + self.acc_angle * (1.0 - self.Gyro_amount)
                 )
 
                 abs_ang = abs(self.robot_angle)
@@ -660,8 +789,9 @@ class PendulumSimulator:
                     step_counter = 0
                     pwr_pct = (abs(self.target_voltage) / self.MAX_VOLTS) * 100.0
                     point = {
-                        "ang": round(self.robot_angle, 2),
-                        "acc": round(self.acc_angle, 2),
+                        "t": time.time(),
+                        "ang": round(self.robot_angle, 4),
+                        "acc": round(self.acc_angle, 4),
                         "gyr": round(self.gyro_y, 2),
                         "pid": round(pwr_pct, 2),
                     }
@@ -687,7 +817,6 @@ class SerialWorker:
         self.ser_lock = threading.Lock()
         self.running = True
 
-    
     def send_command(self, cmd: str):
         cmd_clean = cmd.strip()
         if not cmd_clean:
@@ -695,8 +824,7 @@ class SerialWorker:
         with self.ser_lock:
             if self.ser and self.ser.is_open:
                 try:
-                    # Для однобуквенных команд движения (w/a/s/d/x) отправляем без лишнего перевода строки
-                    if len(cmd_clean) == 1 and cmd_clean.lower() in ("w", "a", "s", "d", "x"):
+                    if len(cmd_clean) == 1 and cmd_clean.lower() in ("w", "a", "s", "d", "x", "0"):
                         payload = cmd_clean.encode("utf-8")
                     else:
                         payload = (cmd_clean + "\n").encode("utf-8")
@@ -818,7 +946,7 @@ def main():
         description="COM-терминал, веб-осциллограф и пульт управления роботом"
     )
     parser.add_argument("-p", "--port", type=str, help="Путь к COM-порту (например, /dev/tty.usbserial-... или COM3)")
-    parser.add_argument("-b", "--baud", type=int, default=230400, help="Скорость порта (по умолчанию 230400)")
+    parser.add_argument("-b", "--baud", type=int, default=115200, help="Скорость порта (по умолчанию 230400)")
     parser.add_argument("-w", "--web-port", type=int, default=8000, help="Порт веб-сервера (по умолчанию 8000)")
     parser.add_argument("--sim", action="store_true", help="Запуск в режиме физической симуляции без платы")
     args = parser.parse_args()
