@@ -1,4 +1,4 @@
-    /*
+ /*
  * "Bal_Code_v8_with_bluetooth_working_SVPWM"
  * By Matt_M
  * This code controls a two wheel balancing robot using the controller and motors from a GoPro sized gimbal
@@ -100,7 +100,7 @@ bool vertical = false;      //is the robot vertical enough to run
 bool GyZ_filter_on = true;  //apply simple average filter to Z gyro reading
 
 
-#define Gyro_amount 0.99999   //percent of gyro in complementary filter T/(T+del_t) del_t: sampling rate, T acc. timeconstant ~1s
+#define Gyro_amount 0.997   //percent of gyro in complementary filter T/(T+del_t) del_t: sampling rate, T acc. timeconstant ~1s
 
 
 //motor control-------------------------------------------------------
@@ -488,7 +488,7 @@ void PID_and_motor_comd()
   if (vertical == true)
   {
     //calculate loop output, try to set robot_angle (error) to zero
-    PID_in = robot_angle;
+    PID_in = robot_angle + angle_offset;
 
     float dInput = (3 * PID_in - 4 * last_PID_in + Last_last_PID_in); //robot angle derivative
     Last_last_PID_in = last_PID_in;
@@ -695,105 +695,121 @@ void writeTo(byte device, byte address, byte value) {
 
 
 
+
 //setup MPU6050
 void angle_setup()
 {
-  Wire.begin();
-  delay (100);
-  writeTo(MPU6050, PWR_MGMT_1, 0);
-  writeTo(MPU6050, ACCEL_CONFIG, accSens << 3); // Specifying output scaling of accelerometer
-  writeTo(MPU6050, GYRO_CONFIG, gyroSens << 3); // Specifying output scaling of gyroscope
-  delay (100);
+  // Пробуждение MPU6050 и настройка диапазонов (обязательно!)
+  writeTo(MPU6050, PWR_MGMT_1, 0x00);          // Выход из спящего режима
+  writeTo(MPU6050, ACCEL_CONFIG, accSens << 3); // ±4g (1g = 8192)
+  writeTo(MPU6050, GYRO_CONFIG, gyroSens << 3); // 250 deg/s
+  delay(50);
 
- // ОБЯЗАТЕЛЬНО сбрасываем старые значения перед повторной калибровкой!
-  GyZ_offset = 0;
-  GyZ_offset_sum = 0;
-  robot_angle = 0;
-  // calc Z gyro offset by averaging 1024 values
-  if (GyZ_filter_on == true)
+  int32_t AcX_sum = 0, AcY_sum = 0, GyZ_sum = 0;
+  uint16_t valid_samples = 0;
+  const uint16_t target_samples = 512;
+
+  for (uint16_t i = 0; i < target_samples; i++)
   {
-    GyZ_filter_on = false;
-    for (int i = 0; i < 1024; i++)
+    // Чтение акселерометра (X, Y)
+    Wire.beginTransmission(MPU6050);
+    Wire.write(0x3B);
+    if (Wire.endTransmission(false) == 0 && Wire.requestFrom(MPU6050, 4, true) == 4)
     {
-      angle_calc();
-   //   Serial.println(GyZ);
-      GyZ_offset_sum += GyZ;
-      digitalWrite(LEDPIN, !digitalRead(LEDPIN));
-      delay (10);
+      int16_t rawAcX = (Wire.read() << 8) | Wire.read();
+      int16_t rawAcY = (Wire.read() << 8) | Wire.read();
+
+      // Чтение гироскопа (Z)
+      Wire.beginTransmission(MPU6050);
+      Wire.write(0x47);
+      if (Wire.endTransmission(false) == 0 && Wire.requestFrom(MPU6050, 2, true) == 2)
+      {
+        int16_t rawGyZ = (Wire.read() << 8) | Wire.read();
+
+        AcX_sum += rawAcX;
+        AcY_sum += rawAcY;
+        GyZ_sum += rawGyZ;
+        valid_samples++;
+      }
     }
-    GyZ_filter_on = true;
+    delay(2);
   }
-  else
+
+  if (valid_samples == 0)
   {
-    for (int i = 0; i < 1024; i++)
-    {
-      angle_calc();
-      Serial.println(GyZ);
-      GyZ_offset_sum += GyZ;
-      digitalWrite(LEDPIN, !digitalRead(LEDPIN));
-      delay (10);
-    }
+    vertical = false;
+    Serial.println("ERR: MPU6050 not responding!");
+    return;
   }
-  GyZ_offset = GyZ_offset_sum >> 10;
-  Serial.print("GyZ offset value = ");
-  Serial.println(GyZ_offset);
+
+  int16_t AcX_avg = AcX_sum / valid_samples;
+  int16_t AcY_avg = AcY_sum / valid_samples;
+  int16_t GyZ_avg = GyZ_sum / valid_samples;
+
+  // 1. Калибровка дрейфа нуля гироскопа (Z)
+  GyZ_offset = -GyZ_avg;
+
+  // 2. Калибровка акселерометра (X - назад, Y - вверх, ±4g -> 1g = 8192)
+  AcX_offset = -AcX_avg;
+  AcY_offset = 8192 - AcY_avg;
+
+  // 3. Начальный угол (0° в вертикальном положении)
+  robot_angle = atan2((float)(AcX_avg + AcX_offset), (float)(AcY_avg + AcY_offset)) * 57.2958f;
+
+  for (uint8_t i = 0; i < 16; i++)
+  {
+    GyZ_filter[i] = 0;
+  }
+  filter_count = 0;
 }
-
-
 
 //calculate robot tilt angle
 void angle_calc()
 {
-  // read raw accel/gyro measurements from device
   Wire.beginTransmission(MPU6050);
-  Wire.write(0x3B);                  // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.write(0x3B);
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050, 4, true);  // request a total of 4 registers
-  AcX = Wire.read() << 8 | Wire.read(); // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)
-  AcY = Wire.read() << 8 | Wire.read(); // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+  Wire.requestFrom(MPU6050, 4, true);
+  AcX = Wire.read() << 8 | Wire.read();
+  AcY = Wire.read() << 8 | Wire.read();
 
   Wire.beginTransmission(MPU6050);
   Wire.write(0x47);
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050, 2, true);  // request a total of 2 registers
-  GyZ = Wire.read() << 8 | Wire.read(); // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+  Wire.requestFrom(MPU6050, 2, true);
+  GyZ = Wire.read() << 8 | Wire.read();
 
   if (GyZ_filter_on == true)
   {
-    // simple low pass filter on gyro
     GyZ_filter[filter_count] = GyZ;
-
     filter_count++;
-
     if (filter_count > 15) filter_count = 0;
 
     GyZ_F = 0;
     for (int i = 0; i < 16; i++)
     {
       GyZ_F += GyZ_filter[i];
-      GyZ = GyZ_F >> 4;
     }
+    GyZ = GyZ_F >> 4;
   }
 
-  // add mpu6050 offset values
   AcX += AcX_offset;
   AcY += AcY_offset;
   GyZ += GyZ_offset;
 
-  //use complementary filter to calculate robot angle
-// Для цикла 4 мс (маска 0x7F):
-robot_angle += GyZ * 6.07968E-5;
+  // Знак "-" согласует ось Z (влево) с наклоном вперёд (+) / назад (-)
+  robot_angle -= GyZ * 6.07968E-5;
 
-// Для цикла 1 мс (маска 0x1F):
-  // robot_angle += GyZ *2 * 1.52E-5; // то же самое, что GyZ * 0.0000152
-  Acc_angle =  atan2(AcY, -AcX) * 57.2958;              //angle from acc. values       * 57.2958 (deg/rad)
-  robot_angle = robot_angle * Gyro_amount + Acc_angle * (1.0 - Gyro_amount);
+  // atan2(AcX, AcY) даёт 0° при вертикальном положении (Y вверх, X назад)
+  Acc_angle = atan2((float)AcX, (float)AcY) * 57.2958f;
+  robot_angle = robot_angle * Gyro_amount + Acc_angle * (1.0f - Gyro_amount);
 
-  //check if robot is vertical
-  if (robot_angle > 65 || robot_angle < -65) vertical = false ;
-  if (robot_angle < 1 && robot_angle > -1) vertical = true;
+  if (robot_angle > 65 || robot_angle < -65) vertical = false;
+
+
+  if (fabs(robot_angle + angle_offset) < 1.0f) vertical = true;
+
 }
-
 
 
 
