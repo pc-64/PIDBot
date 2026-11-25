@@ -42,7 +42,7 @@ bool Bat_Discharged = false;      //true when (Bat_Voltage < dischargeVoltage)
 #define dischargeVoltage  2*3.0*50.76    //number of cells * lipo cell discharged voltage / ((5/1023)*(13.3/3.3))
 #define resetVoltage  2*3.7*50.76        //voltage to reset Bat_Discharged to false
 
-#define FREQ_MASK 0x3FF
+#define FREQ_MASK 0xFFF
 char rx_buf[16];
 uint8_t rx_idx = 0;
 //angle calculations from MPU-6050--------------------------------------------------
@@ -187,6 +187,10 @@ void setup()
 
   // Start Serial Port
   Serial.begin(115200);
+    
+  Wire.begin();          // <-- Обязательно добавить перед обращением к MPU6050
+  Wire.setClock(400000); // Опционально: ускоряет I2C до 400 кГц (рекомендуется для балансиров)
+  
   Serial.println("Bal_Code_v8_with_bluetooth_working_SVPWM" );
   Serial.println("place robot on front or back side withing 5sec. of power for gyroscope calibration");
 
